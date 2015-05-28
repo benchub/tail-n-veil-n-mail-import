@@ -8,11 +8,14 @@ import (
   "strings"
   "flag"
   "encoding/json"
+  "time"
+  "strconv"
 )
 
 import (
   _ "github.com/lib/pq"
   "database/sql"
+  "github.com/briandowns/spinner"
 )
 
 var configFileFlag = flag.String("config", "", "the config file")
@@ -104,16 +107,18 @@ func main() {
   }
   
   if *testIt {
+    testThis := ""
     fmt.Println("Give me a test line to make sure the regex you gave me does what you want it to:")
-    scanner.Scan()
-    line := scanner.Text()
-    if err := scanner.Err(); err != nil {
-      fmt.Println("couldn't read a filter from stdin", err)
-      os.Exit(2)
+    for scanner.Scan() {
+      testThis = testThis + scanner.Text()
+      if err := scanner.Err(); err != nil {
+        fmt.Println("couldn't read a test line from stdin", err)
+        os.Exit(2)
+      }
     }
 
-    if matched := re.MatchString(line); !matched {
-      fmt.Println("Looks like your regex doesn't work for your test case!")
+    if matched := re.MatchString(testThis); !matched {
+      fmt.Println("Looks like your regex '" + *bucketFilter + "' doesn't work for your test case of '" + testThis + "'!")
       os.Exit(4)
     }
   }
@@ -127,13 +132,13 @@ func main() {
   // Let's see if we already have this bucket.
   // If we do, then we should just add this filter to the existing bucket. 
   var id int32
-  err = db.QueryRow(`select id from buckets where name = $1`, *bucketName).Scan(&id)
+  err = tx.QueryRow(`select id from buckets where name = $1`, *bucketName).Scan(&id)
   switch {
     default:
       fmt.Println("Adding to bucket called \"", *bucketName, "\"using filter \"", *bucketFilter, "\"...")
     case err == sql.ErrNoRows:
       // If we don't, then make a new one.
-      err = db.QueryRow(`INSERT INTO buckets(name, eat_it, report_it) VALUES($1, $2, $3) RETURNING id`, *bucketName, *eatIt, *reportIt).Scan(&id)
+      err = tx.QueryRow(`INSERT INTO buckets(name, eat_it, report_it) VALUES($1, $2, $3) RETURNING id`, *bucketName, *eatIt, *reportIt).Scan(&id)
       if err != nil {
         fmt.Println("couldn't insert new bucket", err)
         os.Exit(3)
@@ -146,14 +151,14 @@ func main() {
   if len(hostListFlag) > 0 {
     fmt.Println(".... but only for", strings.Join(hostListFlag,", "))
   }
-  _, err = db.Query(`INSERT INTO filters(bucket_id, filter, report) VALUES($1, $2, $3)`, id, *bucketFilter, *updateCounts)
+  _, err = tx.Exec(`INSERT INTO filters(bucket_id, filter, report) VALUES($1, $2, $3)`, id, *bucketFilter, *updateCounts)
   if err != nil {
     fmt.Println("couldn't insert new bucket filter", err)
     os.Exit(3)
   }
   if len(hostListFlag) > 0 {
     for h := 0; h < len(hostListFlag); h++ {
-      _, err := db.Query(`INSERT INTO onlyon(bucket_id, host) VALUES($1, $2)`, id, hostListFlag[h])
+      _, err := tx.Exec(`INSERT INTO onlyon(bucket_id, host) VALUES($1, $2)`, id, hostListFlag[h])
       if err != nil {
         fmt.Println("couldn't insert new bucket host restriction", err)
         os.Exit(3)
@@ -162,29 +167,45 @@ func main() {
   }
   
   if *apply {
-    fmt.Println("Looking for unclassified matches to new filter... ")
+    s := spinner.New(spinner.CharSets[9], 100*time.Millisecond) 
+    s.Prefix = "Looking for unclassified events for this new filter: "
+    s.Start()
     
     rows, err := db.Query(`select distinct event from events where bucket_id is null`)
     if err != nil {
       fmt.Println("couldn't find unclassified events", err)
       os.Exit(3)
     }
+
+    s.Stop()
+    fmt.Println("")
+    s.Prefix = "Matching events: "
+    s.Start()
+    matches := 0
+    matchables := 0
+
     for rows.Next() {
       var event string
       if err = rows.Scan(&event); err != nil {
         fmt.Println("couldn't read existing event", err)
         os.Exit(3)
       }
-      
+
+      matchables++
+
       // does this event match the new filter?
       if matched := re.MatchString(event); matched {
+        matches++
+
         // let's update the bucket_ids for this event
-        _, err := db.Query(`update events set bucket_id=$1 where bucket_id is null and event=$2`, id, event)
+        _, err := tx.Exec(`update events set bucket_id=$1 where bucket_id is null and event=$2`, id, event)
         if err != nil {
           fmt.Println("couldn't updated matching events", err)
           os.Exit(3)
         }
       }
+
+      s.Suffix = " (filter matched " + strconv.Itoa(matches) + " of " + strconv.Itoa(matchables) + ")"
     }
     if err = rows.Err(); err != nil {
       fmt.Println("couldn't walk rows while looking for matching events", err)
@@ -193,6 +214,8 @@ func main() {
     
     rows.Close()
 
+    s.Suffix = " (filter matched " + strconv.Itoa(matches) + " of " + strconv.Itoa(matchables) + ")"
+    s.Stop()
   }
 
   err = tx.Commit()
@@ -201,7 +224,7 @@ func main() {
     os.Exit(3)
   }
 
-  fmt.Println("... done!")
+  fmt.Println("   done!")
   
   db.Close();
 }
